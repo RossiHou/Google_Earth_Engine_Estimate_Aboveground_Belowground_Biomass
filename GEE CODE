@@ -1,0 +1,253 @@
+//GLDAS-2.2: Global Land Data Assimilation System
+var gaul = ee.FeatureCollection("FAO/GAUL_SIMPLIFIED_500m/2015/level0");
+var Aklan = gaul.filter(ee.Filter.eq('ADM0_NAME', 'Viet Nam'))
+
+Map.centerObject(Aklan,5)
+var roi = Aklan
+Map.addLayer(roi,{},"Alberta")
+
+var start_year='2019'
+var end_year = start_year
+var date_start=start_year+'-01-01'
+var date_end=start_year+ '-12-31'
+var my_scale = 500
+
+
+var index ='bgb'  //bgb agb
+
+var dataset = ee.ImageCollection("NASA/ORNL/biomass_carbon_density/v1")
+             .filterBounds(roi)
+              
+            .select(index)
+              
+//print(dataset)
+var dataset_band = dataset.toBands()
+//print(dataset_band)
+
+
+var eo = ee.ImageCollection('NASA/GLDAS/V021/NOAH/G025/T3H')
+                  .filter(ee.Filter.date('2010-01-01', '2010-12-31'));
+                  
+                  
+var bandseo = ['RootMoist_inst','CanopInt_inst','Qle_tavg']
+
+var eo1 = eo.select(bandseo).median()
+print(eo1)
+
+var eo2 = ee.ImageCollection('NASA/GLDAS/V021/NOAH/G025/T3H')
+                  .filter(ee.Filter.date('2019-01-01', '2019-12-31'));
+
+var eo2 = eo2.select(bandseo).median()
+
+//Plant canopy surface water;Latent heat net flux;Root zone soil moisture
+// According to my search results, plant canopy surface water is the spatial arrangement of the above-ground organs of plants in a plant community1. 
+//Plant canopy surface water affects the photosynthesis, gas exchange, transpiration and temperature regulation of plants.
+var land_1 = ee.ImageCollection("MODIS/061/MCD12Q1")
+              .filterDate("2010-01-01","2010-12-31")
+              .select('LC_Type1')
+              .filterBounds(roi) //// roi or simplifiedCol
+              .median()
+
+
+
+var land_2 = ee.ImageCollection("MODIS/061/MCD12Q1")
+              .filterDate("2019-01-01","2019-12-31")
+              .select('LC_Type1')
+              .filterBounds(roi) //// roi or simplifiedCol
+              .median()
+
+
+
+
+
+
+
+var collection_modis=ee.ImageCollection("MODIS/061/MOD09A1")
+                         .filterDate(date_start,date_end)
+                         .filterBounds(roi) 
+                         // roi or simplifiedCol
+                         .median();
+
+
+
+var qa_band = collection_modis.select('QA').int16();
+var cloud_mask = qa_band.bitwiseAnd(1 << 4).neq(0);
+var masked_image = collection_modis.updateMask(cloud_mask);
+
+
+var modis_img=masked_image.select(['sur_refl_b01', 'sur_refl_b02', 'sur_refl_b03','sur_refl_b04','sur_refl_b07']
+                                   ,['red','nir','blue','green','swir1'])
+
+
+
+var srtm = ee.Image("USGS/SRTMGL1_003");  
+var dem = ee.Algorithms.Terrain(srtm);  
+var elevation = dem.select("elevation");  
+var slope = dem.select("slope");  
+
+var modis_bands = [  
+  'red','nir','blue','green','swir1',  
+  "SLOPE", "ELEVATION",'RootMoist_inst',"LC_Type1" ,'CanopInt_inst','Qle_tavg'
+];  
+
+var modis_final = modis_img
+                   .addBands(elevation.rename("ELEVATION"))  
+                   .addBands(slope.rename("SLOPE"))
+                   .addBands(eo2)
+                   .addBands(land_2)
+                   .select(modis_bands); 
+
+//print(modis_final)
+
+//////////////////////////////////////////////////////
+
+var train_modis=ee.ImageCollection("MODIS/061/MOD09A1")
+                         .filterDate("2010-01-01","2010-12-31")
+                         .filterBounds(roi) 
+                         .median();
+
+var masked_train = train_modis.updateMask(cloud_mask);
+
+var train_img = masked_train.select(['sur_refl_b01', 'sur_refl_b02', 'sur_refl_b03','sur_refl_b04','sur_refl_b07']
+                                   ,['red','nir','blue','green','swir1'])
+
+var train_final = train_img
+                   .addBands(elevation.rename("ELEVATION"))  
+                   .addBands(slope.rename("SLOPE"))
+                   .addBands(eo1)
+                   .addBands(land_1)  
+                   .select(modis_bands); 
+
+//print(train_final)
+
+var train_final_addband = train_final.addBands(dataset_band) 
+print("train",train_final_addband)
+
+var item_sample = train_final_addband.sample({
+                    region: roi.geometry().bounds(),
+                    tileScale:16,
+                    numPixels:50000,
+                    scale: my_scale,
+                    geometries: true
+                  }); 
+
+var sampledata=item_sample
+sampledata = sampledata.randomColumn();
+var fea_train = sampledata.filter(ee.Filter.lt('random',0.7));
+//print("training point",fea_train.size());
+var fea_test = sampledata.filter(ee.Filter.gte('random',0.7));
+//print("validation point",fea_test.size());
+
+var classifier = ee.Classifier.smileRandomForest(80).setOutputMode('REGRESSION')
+.train({ //
+  features: fea_train,   
+  classProperty: '2010_bgb', //which one you want to class 
+  inputProperties: modis_bands
+  }); 
+  
+
+var classified = modis_final.classify(classifier,'predicted')
+
+Export.image.toDrive({
+image: classified,
+description: 'bgb',
+folder: "abg",
+region: roi.geometry().bounds(), 
+scale: 500,
+crs: "EPSG:4326",
+maxPixels: 1e13
+})
+
+
+
+//print(classified)
+/*var palettes = require('users/gena/packages:palettes');
+var palette = palettes.colorbrewer.YlGn[5];
+
+var clas_min = classified.reduceRegion({
+  reducer: ee.Reducer.min(),
+  geometry:roi.geometry().bounds(),  
+  scale:my_scale,  
+  maxPixels:1e13,
+  bestEffort: true
+})
+//print(clas_min.getNumber('predicted').getInfo())
+
+
+var clas_max = classified.reduceRegion({
+  reducer: ee.Reducer.max(),
+  geometry:roi.geometry().bounds(),  
+  scale:my_scale,  
+  maxPixels:1e13,
+  bestEffort: true
+})
+
+//print(clas_max.getNumber('predicted').getInfo())
+
+var classified_vis = classified.clipToCollection(roi);
+
+var vis = {palette:palette,min:clas_min.getNumber('predicted').getInfo(),
+  max:clas_max.getNumber('predicted').getInfo()
+}
+Map.addLayer(classified_vis,vis,"res")
+
+
+/*var predict_T = classified.sampleRegions({collection:fea_train,geometries:true})
+
+
+var sample_T = predict_T.select(['2010_agb','predicted']);
+//print("sdf",sample_T)
+
+
+/*var chart_T = ui.Chart.feature.byFeature(sample_T,'2010_agb','predicted')
+.setChartType("ScatterChart").setOptions({
+  title: 'training data',
+  hAxis: {'title':'observed'},
+  vAxis: {'title':'predicted'},
+  pointSize :3,
+  trendlines:{0:{showR2:true,visibleInLegend: true},
+              1:{showR2:true,visibleInLegend: true}
+  }
+})
+print(chart_T)
+
+var ob_T = ee.Array(sample_T.aggregate_array('2010_agb'));
+var pre_T = ee.Array(sample_T.aggregate_array('predicted'));
+
+var residual_T = ob_T.subtract(pre_T)
+
+var rmse_T = residual_T.pow(2).reduce('mean',[0]).sqrt();
+print(rmse_T)*/
+
+
+
+//////////////////////////////
+//var clas_repro = classified.reproject({crs:"EPSG:32735",scale:5000})
+/*var predict_V = classified.sampleRegions({collection:fea_test,geometries:true,scale:my_scale})
+
+
+var sample_V = predict_V.select(['2010_agb','predicted']);
+
+var ob_V = ee.Array(sample_V.aggregate_array('2010_agb'));
+var pre_V = ee.Array(sample_V.aggregate_array('predicted'));
+
+/*var chart_V = ui.Chart.feature.byFeature(sample_V,'2010_agb','predicted')
+.setChartType("ScatterChart").setOptions({
+  title: 'validation data',
+  hAxis: {'title':'observed'},
+  vAxis: {'title':'predicted'},
+  pointSize :3,
+  trendlines:{0:{showR2:true,visibleInLegend: true},
+              1:{showR2:true,visibleInLegend: true}
+  }
+})*/
+/*
+print(chart_V)
+
+var residual_V = ob_V.subtract(pre_V)
+
+var rmse_V = residual_V.pow(2).reduce('mean',[0]).sqrt();
+print(rmse_V)*/
+
+
+
